@@ -1,0 +1,539 @@
+# Knowledge Proof Design Overview
+
+## 1. Goals and requirements
+
+Build a small SaaS-style learning platform:
+
+* Monorepo using **Nx**
+* **Frontend**: Next.js (TypeScript, React)
+* **Backend**: Rust API (Axum or similar)
+* **Auth**: Sui **zkLogin** (“Sign in with Sui”)
+* **Data**: Postgres
+* **Deployment**: Docker images for frontend + backend (+ Postgres via compose)
+* Features:
+
+  * Collections (e.g. “Sui 101”)
+  * Lessons with markdown content
+  * Quizzes per lesson
+  * User progress (lesson completion + quiz attempts)
+
+---
+
+## 2. High-level architecture
+
+### 2.1 Monorepo structure (Nx)
+
+* `apps/frontend` – Next.js app
+* `apps/api` – Rust Axum API
+* `libs/shared-types` – common TypeScript types for API payloads
+* `libs/api-client` – typed TS client to call the Rust API
+* `libs/config` – shared config (endpoints, env var parsing helpers)
+
+### 2.2 Service responsibilities
+
+* **Frontend (Next.js)**:
+
+  * Handles zkLogin UI flow.
+  * Exchanges zkLogin data for an app JWT.
+  * Stores session (JWT) and attaches it to API calls.
+  * Renders collections, lessons, quizzes, progress.
+
+* **Rust API**:
+
+  * Verifies app JWT and maps to internal `user` table.
+  * Manages content data (collections, lessons, quizzes).
+  * Records user progress and quiz attempts.
+  * Offers REST JSON endpoints.
+
+* **Postgres**:
+
+  * Persist users, content, progress.
+
+---
+
+## 3. Directory layout and tooling
+
+### 3.1 Initial Nx workspace
+
+Use npm or pnpm at root.
+
+* Initialize workspace:
+
+  * `npx create-nx-workspace@latest sui-workspace`
+* Choose integrated repo.
+
+Add Next.js app via Nx generator:
+
+* `npx nx generate @nx/next:app frontend`
+
+Add Rust app manually:
+
+* `cargo new --bin api` inside `apps/api`.
+* Add `apps/api/project.json` with Nx `run-commands` targets (`build`, `test`, `serve`).
+
+Add libraries:
+
+* `libs/shared-types`
+* `libs/api-client`
+* `libs/config`
+
+You can ask the LLM to:
+
+> Generate a minimal Nx `project.json` for a Rust app in `apps/api` that has `build`, `test`, and `serve` targets using `nx:run-commands` and `cargo`.
+
+---
+
+## 4. Authentication with Sui zkLogin
+
+### 4.1 Token model
+
+Use a two-level model:
+
+1. **zkLogin JWT** (from Sui infra):
+
+   * Proves a web2 login and binds it to a Sui address.
+   * Used once at login.
+
+2. **App JWT** (your token):
+
+   * Signed with your own secret/keypair.
+   * Contains:
+
+     * `sub`: internal `user.id`
+     * `addr`: Sui address
+     * Optional: `iat`, `exp`
+   * Used for all calls from frontend → Rust API.
+
+### 4.2 Auth flow
+
+1. User visits `/login` on the frontend.
+2. Clicks “Sign in with Sui”:
+
+   * Frontend redirects to zkLogin provider (Sui) with client id, redirect URI, etc.
+3. zkLogin redirects back to `/auth/callback` with tokens / proof.
+4. Frontend calls an internal route (e.g. Next.js API route `/api/auth/complete`) with zkLogin result.
+5. That route calls Rust `POST /api/auth/exchange`:
+
+   * Payload: zkLogin token/proof.
+6. Rust API:
+
+   * Verifies zkLogin token.
+   * Extracts Sui address and subject.
+   * Finds or creates user in DB (by `sui_address`).
+   * Issues an app JWT.
+   * Returns app JWT.
+7. Next.js:
+
+   * Stores app JWT in an `HttpOnly` cookie (via `Set-Cookie` from the API route), or other secure method.
+8. Future requests:
+
+   * Frontend API client attaches `Authorization: Bearer <app_jwt>` to calls.
+9. Rust API middleware:
+
+   * Validates app JWT signature.
+   * Extracts `user_id`, `sui_address`.
+   * Makes user available to handlers via request extensions.
+
+You can ask the LLM to:
+
+> Design the exact request/response schema for `POST /api/auth/exchange`, and sketch Axum handlers plus middleware to validate an app JWT with `jsonwebtoken`.
+
+---
+
+## 5. Backend design (Rust / Axum)
+
+### 5.1 Crates and dependencies
+
+In `apps/api/Cargo.toml`, include:
+
+* `axum` – routing
+* `tokio` – async runtime
+* `tower` / `tower-http` – middleware
+* `serde`, `serde_json` – JSON
+* `sqlx` (with `postgres` & `runtime-tokio-native-tls` features) – DB
+* `uuid` – UUIDs
+* `jsonwebtoken` – JWT validation / issuing
+* `chrono` – timestamps
+* `dotenvy` or `config` – env configuration
+* `tracing`, `tracing-subscriber` – logging
+
+Ask the LLM:
+
+> Create a `Cargo.toml` for an Axum-based API named `api` that uses sqlx + Postgres, jsonwebtoken, tracing, and serde. Include sensible versions and features.
+
+### 5.2 Database schema
+
+Use SQL migrations. Schema:
+
+#### `users`
+
+* `id` UUID PK (default `gen_random_uuid()`).
+* `sui_address` TEXT UNIQUE NOT NULL.
+* `zklogin_subject` TEXT NULL.
+* `display_name` TEXT NULL.
+* `avatar_url` TEXT NULL.
+* `created_at` TIMESTAMPTZ DEFAULT `now()`.
+* `updated_at` TIMESTAMPTZ DEFAULT `now()`.
+
+#### `collections`
+
+* `id` UUID PK.
+* `slug` TEXT UNIQUE.
+* `title` TEXT.
+* `description` TEXT.
+* `created_at` TIMESTAMPTZ.
+
+#### `lessons`
+
+* `id` UUID PK.
+* `collection_id` UUID FK → `collections(id)`.
+* `slug` TEXT UNIQUE.
+* `title` TEXT.
+* `summary` TEXT.
+* `estimated_minutes` INT.
+* `order_index` INT.
+* `body_md` TEXT.
+* `created_at` TIMESTAMPTZ.
+
+#### `quizzes`
+
+* `id` UUID PK.
+* `lesson_id` UUID FK → `lessons(id)`.
+* `question` TEXT.
+
+#### `quiz_answers`
+
+* `id` UUID PK.
+* `quiz_id` UUID FK → `quizzes(id)`.
+* `answer_text` TEXT.
+* `is_correct` BOOLEAN.
+
+#### `user_lesson_progress`
+
+* `user_id` UUID FK → `users(id)`.
+* `lesson_id` UUID FK → `lessons(id)`.
+* `completed` BOOLEAN.
+* `completed_at` TIMESTAMPTZ.
+* PK (`user_id`, `lesson_id`).
+
+#### `user_quiz_attempts`
+
+* `id` UUID PK.
+* `user_id` UUID FK → `users(id)`.
+* `quiz_id` UUID FK → `quizzes(id)`.
+* `is_correct` BOOLEAN.
+* `created_at` TIMESTAMPTZ.
+
+Ask the LLM:
+
+> Write sqlx migrations for Postgres to create the `users`, `collections`, `lessons`, `quizzes`, `quiz_answers`, `user_lesson_progress`, and `user_quiz_attempts` tables as specified.
+
+### 5.3 API endpoints
+
+Base path: `/api`.
+
+Unauthenticated (public):
+
+* `GET /api/collections`
+
+  * Returns list of collections with basic info and counts.
+* `GET /api/collections/{slug}`
+
+  * Returns collection details + list of lessons (without full body).
+* `GET /api/lessons/{slug}`
+
+  * Returns full lesson data:
+
+    * Title, summary, `body_md`, `quizzes` (questions + answers, but mark correct answer only server-side or omit `is_correct`).
+
+Authenticated:
+
+* `POST /api/auth/exchange`
+
+  * See auth section.
+* `GET /api/me`
+
+  * Returns current user info based on app JWT.
+* `GET /api/progress`
+
+  * Returns per-lesson completion + quiz correctness for the current user.
+* `POST /api/lessons/{lesson_id}/complete`
+
+  * Marks lesson complete for current user.
+* `POST /api/quizzes/{quiz_id}/answer`
+
+  * Body: `{ "answer_id": "<uuid>" }`.
+  * Checks correctness, records attempt, returns `{ "correct": bool, "explanation": string }`.
+
+Ask the LLM:
+
+> Generate Axum route setup and handler function signatures for the endpoints above, using sqlx for DB access and a middleware that injects `User` into the request when an app JWT is valid.
+
+---
+
+## 6. Frontend design (Next.js)
+
+Assume App Router (`app/`), but you can adapt to Pages Router.
+
+### 6.1 Routes
+
+* `/` – Landing:
+
+  * Explanation, “Sign in with Sui” button.
+* `/login`:
+
+  * Triggers zkLogin redirect.
+* `/auth/callback`:
+
+  * Handles zkLogin callback, exchanges token via `/api/auth/complete`, then redirects to `/dashboard`.
+* `/dashboard`:
+
+  * Requires auth.
+  * Shows list of collections with progress.
+* `/collections/[slug]`:
+
+  * Requires auth.
+  * Shows collection details and ordered lesson list with completion status.
+* `/lessons/[slug]`:
+
+  * Requires auth.
+  * Renders lesson markdown.
+  * Renders quizzes and “Mark as complete” UI.
+
+Ask the LLM:
+
+> Generate a Next.js App Router structure for the routes above, with placeholder components and TypeScript types for data returned from the Rust API.
+
+### 6.2 Shared types and API client
+
+In `libs/shared-types`:
+
+* TS interfaces mirroring backend DTOs:
+
+  * `CollectionSummary`
+  * `CollectionDetail`
+  * `LessonSummary`
+  * `LessonDetail`
+  * `Quiz`
+  * `QuizAnswer`
+  * `UserProgress`, etc.
+
+In `libs/api-client`:
+
+* `getCollections()`
+* `getCollection(slug)`
+* `getLesson(slug)`
+* `getProgress()`
+* `markLessonComplete(lessonId)`
+* `answerQuiz(quizId, answerId)`
+
+All functions:
+
+* Accept a base URL / fetch impl.
+* Attach `Authorization` header when JWT is present.
+
+Ask the LLM:
+
+> Define TypeScript interfaces and a minimal API client for the endpoints, assuming they return JSON in a straightforward REST style.
+
+### 6.3 Lesson rendering and quizzes
+
+* Use a markdown renderer (e.g., `react-markdown`) to render `body_md`.
+* Quiz component:
+
+  * Displays question and answers as buttons.
+  * On click:
+
+    * Calls `answerQuiz`.
+    * Shows feedback (correct/incorrect + explanation).
+* Lesson completion:
+
+  * “Mark as complete” button calls `markLessonComplete`.
+  * UI updates completion state locally and via `/api/progress`.
+
+Ask the LLM:
+
+> Implement a `LessonPage` component in Next.js that fetches lesson data, renders markdown, shows quizzes, and wires up `answerQuiz` and `markLessonComplete` with optimistic updates.
+
+---
+
+## 7. Docker and local environment
+
+### 7.1 Dockerfiles
+
+Backend: `apps/api/Dockerfile` (multi-stage):
+
+* Stage 1: build
+
+  * `FROM rust:…`
+  * `WORKDIR /app`
+  * Copy workspace files.
+  * Build `api` in release mode.
+* Stage 2: runtime
+
+  * `FROM gcr.io/distroless/cc` (or small base).
+  * Copy binary.
+  * Expose port (e.g., 8080).
+  * `CMD ["/api"]`.
+
+Frontend: `apps/frontend/Dockerfile` (multi-stage):
+
+* Stage 1: builder
+
+  * `FROM node:…`
+  * Install deps, run `nx build frontend`.
+* Stage 2: runtime
+
+  * `FROM node:…`
+  * Copy `.next`, `package.json`, etc.
+  * `CMD ["node", "server.js"]` or `next start`.
+
+Ask the LLM:
+
+> Create multi-stage Dockerfiles for the Next.js frontend and Rust API in an Nx monorepo, optimizing for small final images and production use.
+
+### 7.2 docker-compose.yml (local dev)
+
+* Services:
+
+  * `db` (Postgres)
+  * `api` (Rust)
+  * `frontend` (Next.js)
+* Networks:
+
+  * Shared network.
+* Env:
+
+  * `DATABASE_URL` for `api`.
+  * `API_BASE_URL` / `NEXT_PUBLIC_API_BASE_URL` for frontend.
+  * JWT secrets and zkLogin configuration as env vars.
+
+Ask the LLM:
+
+> Produce a `docker-compose.yml` that runs Postgres, the Rust API, and the Next.js frontend together, wiring ports and environment variables appropriately.
+
+---
+
+## 8. Nx integration and CI
+
+### 8.1 Nx project graph
+
+* Ensure `nx.json` and project configs declare:
+
+  * `frontend` depends on `shared-types` and `api-client`.
+  * `api-client` depends on `shared-types`.
+
+* Use tags (optional) to enforce boundaries (`scope:frontend`, `scope:backend`).
+
+### 8.2 GitHub Actions CI
+
+Workflow steps:
+
+1. Checkout.
+2. Setup Node and Rust.
+3. Install JS deps: `npm ci` or `pnpm install`.
+4. Cache Rust target dir.
+5. `nx lint frontend`.
+6. `nx test frontend`.
+7. `nx run api:test` (or `cargo test`).
+8. `nx build frontend`.
+9. `nx run api:build` (or `cargo build --release`).
+10. Build Docker images and push on `main`.
+
+Ask the LLM:
+
+> Create a GitHub Actions workflow `ci.yml` for an Nx monorepo with a Next.js frontend and Rust backend, running lint/test/build for both, and building Docker images on pushes to main.
+
+---
+
+## 9. Content authoring and seeding
+
+### 9.1 Content source
+
+Keep initial content in simple YAML or JSON fixture files committed to the repo, e.g.:
+
+* `content/sui-101/collection.yaml`
+* `content/sui-101/lessons/*.yaml` with fields:
+
+  * `slug`, `title`, `summary`, `estimated_minutes`, `order_index`, `body_md`, `quizzes`.
+
+### 9.2 Seeder
+
+* Write a small Rust or Node script that:
+
+  * Reads the content files.
+  * Inserts rows into `collections`, `lessons`, `quizzes`, `quiz_answers` if they don’t exist.
+
+Ask the LLM:
+
+> Produce a Rust command-line seeder that reads YAML files describing collections and lessons, and inserts/updates rows in the Postgres database used by the API.
+
+---
+
+## 10. Milestones with LLM prompts
+
+Use this sequence as an implementation roadmap.
+
+### Milestone 1: Monorepo + skeleton apps
+
+* Set up Nx.
+* Add Next.js `frontend`.
+* Add Rust `api` with Axum “hello world”.
+
+LLM prompt example:
+
+> Help me initialize an Nx workspace with a Next.js app in `apps/frontend` and a Rust Axum app in `apps/api`, including Nx `project.json` for the Rust app with `build`, `serve`, and `test` targets.
+
+### Milestone 2: DB schema + migrations
+
+* Add Postgres, migrations, and sqlx integration.
+
+LLM prompt example:
+
+> Using sqlx and Postgres, write migrations and Rust setup code (connection pool, health check endpoint) for the schema we defined (`users`, `collections`, `lessons`, `quizzes`, `quiz_answers`, `user_lesson_progress`, `user_quiz_attempts`).
+
+### Milestone 3: Sui zkLogin auth
+
+* Implement `/login` and `/auth/callback` in Next.js.
+* Implement `POST /api/auth/exchange`.
+* Implement app JWT issuance and verification middleware.
+
+LLM prompt example:
+
+> Implement a zkLogin-based sign-in flow: Next.js routes for `/login` and `/auth/callback`, a Rust Axum endpoint `/api/auth/exchange` that verifies zkLogin tokens and returns an app JWT, and middleware to protect other endpoints using that app JWT.
+
+### Milestone 4: Public content endpoints
+
+* Implement `GET /api/collections`, `GET /api/collections/{slug}`, `GET /api/lessons/{slug}`.
+* Frontend pages to list collections and show lesson content.
+
+LLM prompt example:
+
+> Implement Axum handlers for the public content endpoints and corresponding Next.js pages for `/collections/[slug]` and `/lessons/[slug]`, using a shared TypeScript/JSON schema.
+
+### Milestone 5: Progress and quizzes
+
+* Implement `GET /api/progress`, `POST /api/lessons/{id}/complete`, `POST /api/quizzes/{id}/answer`.
+* Wire up quiz and progress UI on the frontend.
+
+LLM prompt example:
+
+> Implement the authenticated progress endpoints in Rust and update the Next.js lesson page to render quizzes, call `answerQuiz`, and mark lessons complete, updating a progress bar on the collection page.
+
+### Milestone 6: Docker + docker-compose
+
+* Write Dockerfiles for both apps.
+* Write `docker-compose.yml`.
+
+LLM prompt example:
+
+> Produce production-ready multi-stage Dockerfiles for the Next.js and Rust apps, plus a docker-compose file to run them with Postgres locally.
+
+### Milestone 7: CI (GitHub Actions) and polish
+
+* Add Nx-aware CI workflow.
+* Add logging, error handling, and minimal styling.
+
+LLM prompt example:
+
+> Generate a GitHub Actions workflow that installs Node and Rust, runs Nx lint/test/build for `frontend` and `api`, and builds Docker images, caching dependencies where appropriate.
